@@ -1,0 +1,20 @@
+{
+  "name": "easyeda-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that wraps the easyeda-api-skill bridge to control EasyEDA Pro from Claude Code.",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "easyeda-mcp": "index.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "smoke": "node smoke-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
