@@ -221,4 +221,80 @@ export const edaTools = [
       }
     },
   },
+  {
+    definition: {
+      name: "easyeda_get_state",
+      description:
+        "One-call orientation: current project, board, PCB, schematic, and active DRC config name. Fields that don't apply to the current editor context return {error} instead of failing the call.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    buildCode: () => `
+      const tryCall = async (fn) => { try { return await fn(); } catch (e) { return { error: e.message }; } };
+      const [project, board, pcb, schematic, drcConfigName] = await Promise.all([
+        tryCall(() => eda.dmt_Project.getCurrentProjectInfo()),
+        tryCall(() => eda.dmt_Board.getCurrentBoardInfo()),
+        tryCall(() => eda.dmt_Pcb.getCurrentPcbInfo()),
+        tryCall(() => eda.dmt_Schematic.getCurrentSchematicInfo()),
+        tryCall(() => eda.pcb_Drc.getCurrentRuleConfigurationName()),
+      ]);
+      return { ok: true, project, board, pcb, schematic, drcConfigName };
+    `,
+  },
+  {
+    definition: {
+      name: "easyeda_open_project",
+      description:
+        "Open a project by (partial, case-insensitive) name. Scans all teams/folders in parallel inside EasyEDA. If multiple projects match, returns the candidate list instead of opening. NOTE: openProject may discard unsaved changes in the current project.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Project name or substring" },
+        },
+        required: ["name"],
+      },
+    },
+    buildCode: (args) => `
+      const needle = ${JSON.stringify(args.name)}.toLowerCase();
+      const teams = (await eda.dmt_Team.getAllTeamsInfo()) || [];
+      const matches = [];
+      await Promise.all(teams.map(async (team) => {
+        const teamUuid = team.uuid ?? team.teamUuid ?? team.id;
+        if (!teamUuid) return;
+        let folderUuids = [];
+        try { folderUuids = (await eda.dmt_Folder.getAllFoldersUuid(teamUuid)) || []; } catch (e) {}
+        const scopes = [undefined, ...folderUuids];
+        await Promise.all(scopes.map(async (folderUuid) => {
+          let uuids = [];
+          try { uuids = (await eda.dmt_Project.getAllProjectsUuid(teamUuid, folderUuid)) || []; } catch (e) { return; }
+          await Promise.all(uuids.map(async (uuid) => {
+            try {
+              const info = await eda.dmt_Project.getProjectInfo(uuid);
+              const label = String((info && (info.friendlyName ?? info.name ?? info.projectName)) ?? "");
+              if (label.toLowerCase().includes(needle)) matches.push({ uuid, name: label });
+            } catch (e) {}
+          }));
+        }));
+      }));
+      const unique = [...new Map(matches.map((m) => [m.uuid, m])).values()];
+      if (unique.length === 0) return { ok: false, error: "No project name matched: " + needle };
+      if (unique.length > 1) return { ok: false, error: "Multiple projects matched — be more specific.", matches: unique };
+      await eda.dmt_Project.openProject(unique[0].uuid);
+      return { ok: true, opened: unique[0] };
+    `,
+  },
+  {
+    definition: {
+      name: "easyeda_save",
+      description:
+        "Save the currently open PCB and/or schematic documents (whichever are active). Returns per-document results.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    buildCode: () => `
+      const results = {};
+      try { results.pcb = await eda.pcb_Document.save(); } catch (e) { results.pcb = { error: e.message }; }
+      try { results.schematic = await eda.sch_Document.save(); } catch (e) { results.schematic = { error: e.message }; }
+      const anyOk = [results.pcb, results.schematic].some((r) => r === true || (r && r.error === undefined));
+      return { ok: anyOk, results };
+    `,
+  },
 ];

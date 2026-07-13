@@ -67,6 +67,9 @@ async function main() {
     "easyeda_drc_set_rules",
     "easyeda_drc_check",
     "easyeda_drc_net_classes",
+    "easyeda_get_state",
+    "easyeda_open_project",
+    "easyeda_save",
   ];
   const missing = expected.filter((n) => !names.includes(n));
   if (missing.length) throw new Error(`Missing tools: ${missing.join(", ")}`);
