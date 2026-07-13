@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { edaTools } from "./eda-tools.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = join(__dirname, "logs");
@@ -190,7 +191,7 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...tools, ...edaTools.map((t) => t.definition)] }));
 
 function reply(obj) {
   return {
@@ -282,6 +283,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       invalidatePort();
       return reply({ ok: true, message: `Stopped bridge (pid=${pid}, port=${port})` });
+    }
+
+    const hl = edaTools.find((t) => t.definition.name === name);
+    if (hl) {
+      const r = await executeCode(hl.buildCode(args), { timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : DEFAULT_EXECUTE_TIMEOUT_MS });
+      return reply(r);
     }
 
     return reply({ ok: false, message: `Unknown tool: ${name}` });
