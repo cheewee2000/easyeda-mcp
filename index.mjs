@@ -204,20 +204,29 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     if (name === "easyeda_health") {
       const autostart = args.autostart !== false;
-      const port = await getPort({ autostart });
-      if (!port) {
-        if (autostart) {
+      let port = await getPort({ autostart: false });
+      let started = false;
+      if (!port && autostart) {
+        const r = await ensureBridge();
+        if (r.port) {
+          cachedPort = r.port;
+          port = r.port;
+          started = r.started;
+        } else {
           return reply({
             ok: false,
             message: "Bridge auto-start failed",
+            error: r.error,
             logPath: join(LOG_DIR, "bridge.log"),
           });
         }
+      }
+      if (!port) {
         return reply({ ok: false, message: "Bridge not running (autostart disabled)." });
       }
       const h = await httpJson(`http://127.0.0.1:${port}/health`);
       if (!h.ok) invalidatePort();
-      return reply({ ok: h.ok, port, health: h.data });
+      return reply({ ok: h.ok, port, started, health: h.data });
     }
 
     if (name === "easyeda_list_windows") {
