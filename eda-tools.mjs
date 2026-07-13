@@ -253,7 +253,11 @@ export const edaTools = [
         required: ["name"],
       },
     },
-    buildCode: (args) => `
+    buildCode: (args) => {
+      if (typeof args.name !== "string" || !args.name.trim()) {
+        return `return { ok: false, error: "name must be a non-empty string" };`;
+      }
+      return `
       const needle = ${JSON.stringify(args.name)}.toLowerCase();
       const teams = (await eda.dmt_Team.getAllTeamsInfo()) || [];
       const matches = [];
@@ -280,7 +284,8 @@ export const edaTools = [
       if (unique.length > 1) return { ok: false, error: "Multiple projects matched — be more specific.", matches: unique };
       await eda.dmt_Project.openProject(unique[0].uuid);
       return { ok: true, opened: unique[0] };
-    `,
+    `;
+    },
   },
   {
     definition: {
