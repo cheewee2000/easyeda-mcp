@@ -17,7 +17,7 @@ export const edaTools = [
     definition: {
       name: "easyeda_drc_get_rules",
       description:
-        "Get the current PCB DRC rule configuration (shape: {name, config:{Spacing,Physics,...}}), plus the list of saved configuration names. Values are in mm. Requires a PCB document open in EasyEDA Pro.",
+        "Get the current PCB DRC rule configuration (shape: {name, config:{Spacing,Physics,...}}), the list of saved configuration names, and the per-net/region/net-by-net rule tables (netRules, regionRules, netByNetRules). Values are in mm. Requires a PCB document open in EasyEDA Pro. Use this before easyeda_drc_set_rules to read-modify-write netRules/regionRules/netByNetRules (the only rule writes that reliably work in EasyEDA Pro v2.2.47.x — see easyeda_drc_set_rules description).",
       inputSchema: { type: "object", properties: {} },
     },
     buildCode: () => `
@@ -28,35 +28,128 @@ export const edaTools = [
         const all = (await eda.pcb_Drc.getAllRuleConfigurations(true)) || [];
         saved = all.map((c) => (c && typeof c === "object" ? (c.name ?? JSON.stringify(c).slice(0, 60)) : String(c)));
       } catch (e) { saved = ["<getAllRuleConfigurations failed: " + e.message + ">"]; }
+      let netRules = null, netRulesError = null;
+      try { netRules = await eda.pcb_Drc.getNetRules(); } catch (e) { netRulesError = e.message; }
+      let regionRules = null, regionRulesError = null;
+      try { regionRules = await eda.pcb_Drc.getRegionRules(); } catch (e) { regionRulesError = e.message; }
+      let netByNetRules = null, netByNetRulesError = null;
+      try { netByNetRules = await eda.pcb_Drc.getNetByNetRules(); } catch (e) { netByNetRulesError = e.message; }
       if (!config) return { ok: false, error: "getCurrentRuleConfiguration returned undefined — is a PCB document open and active?" };
-      return { ok: true, name, config, savedConfigurations: saved };
+      return {
+        ok: true,
+        name,
+        config,
+        savedConfigurations: saved,
+        netRules,
+        netRulesError,
+        regionRules,
+        regionRulesError,
+        netByNetRules,
+        netByNetRulesError,
+      };
     `,
   },
   {
     definition: {
       name: "easyeda_drc_set_rules",
       description:
-        "Modify the current PCB DRC rules without any manual clicking. Pass a partial object matching the shape returned by easyeda_drc_get_rules (e.g. {config:{Physics:{Track:{copperThickness1oz:{form:{strokeWidthMin:0.15}}}}}}). It is deep-merged into the current configuration (objects merge recursively; arrays like spacing tables are replaced wholesale — pass the full table) and written back. Optionally save the result as a named configuration.",
+        "Write PCB DRC rules without any manual clicking. KNOWN ENGINE BUG in EasyEDA Pro v2.2.47.x: writing the global rule configuration (the `rules` param, which merges into Physics/Spacing/etc via overwriteCurrentRuleConfiguration) deadlocks the underlying BETA API — this tool races it against a 5s timer and fails fast with guidance instead of hanging. saveRuleConfiguration (used by saveAs) is also non-functional in that build (returns false, no-ops). By contrast, per-net rules (netRules), region rules (regionRules), and net-by-net rules (netByNetRules) use working overwrite*Rules APIs that resolve in milliseconds — prefer these when possible. Pass any combination of rules/netRules/regionRules/netByNetRules; at least one is required. Read current values first via easyeda_drc_get_rules — netRules/regionRules/netByNetRules are full-array/object replacements, not merges.",
       inputSchema: {
         type: "object",
         properties: {
-          rules: { type: "object", description: "Partial rule configuration to merge in. Units: mm." },
-          saveAs: { type: "string", description: "Optional: also persist the merged config under this name (overwrites same-named custom config)." },
+          rules: {
+            type: "object",
+            description:
+              "Partial global rule configuration to deep-merge in (e.g. {config:{Physics:{Track:{copperThickness1oz:{form:{strokeWidthMin:0.15}}}}}}). Units: mm. WARNING: writing this is known to hang for 5s and then fail in EasyEDA Pro v2.2.47.x (overwriteCurrentRuleConfiguration deadlocks upstream) — prefer netRules/regionRules/netByNetRules when the change fits there.",
+          },
+          netRules: {
+            type: "array",
+            description:
+              "Full net-rules array, written via the working overwriteNetRules API; arrays replace the full rule set — read first via easyeda_drc_get_rules.",
+          },
+          regionRules: {
+            type: "array",
+            description:
+              "Full region-rules array, written via the working overwriteRegionRules API; arrays replace the full rule set — read first via easyeda_drc_get_rules.",
+          },
+          netByNetRules: {
+            type: "object",
+            description:
+              "Full net-by-net rules object, written via the working overwriteNetByNetRules API; arrays replace the full rule set — read first via easyeda_drc_get_rules.",
+          },
+          saveAs: { type: "string", description: "Optional: also persist the merged global config under this name (only applies when rules is provided; overwrites same-named custom config). Known non-functional in EasyEDA Pro v2.2.47.x (saveRuleConfiguration no-ops)." },
         },
-        required: ["rules"],
       },
     },
-    buildCode: (args) => `
-      const current = await eda.pcb_Drc.getCurrentRuleConfiguration();
-      if (!current) return { ok: false, error: "No current rule configuration — is a PCB document open and active?" };
-      const patch = ${JSON.stringify(args.rules)};
-      const deepMerge = ${DEEP_MERGE_SRC};
-      const merged = deepMerge(current, patch);
-      const wrote = await eda.pcb_Drc.overwriteCurrentRuleConfiguration(merged);
-      let savedAs = null;
-      ${args.saveAs ? `savedAs = await eda.pcb_Drc.saveRuleConfiguration(merged, ${JSON.stringify(args.saveAs)}, true);` : ""}
-      return { ok: wrote === true, wrote, savedAs, configName: merged.name };
-    `,
+    buildCode: (args) => {
+      const hasRules = args.rules !== undefined && args.rules !== null;
+      const hasNetRules = Array.isArray(args.netRules);
+      const hasRegionRules = Array.isArray(args.regionRules);
+      const hasNetByNetRules = args.netByNetRules !== undefined && args.netByNetRules !== null && typeof args.netByNetRules === "object";
+
+      if (!hasRules && !hasNetRules && !hasRegionRules && !hasNetByNetRules) {
+        return `return { ok: false, error: "easyeda_drc_set_rules requires at least one of: rules, netRules, regionRules, netByNetRules." };`;
+      }
+
+      const steps = [`const results = {};`];
+
+      if (hasNetRules) {
+        steps.push(`
+      try {
+        const r = await eda.pcb_Drc.overwriteNetRules(${JSON.stringify(args.netRules)});
+        results.netRules = { ok: r === true, wrote: r };
+      } catch (e) { results.netRules = { ok: false, error: e.message }; }`);
+      }
+      if (hasRegionRules) {
+        steps.push(`
+      try {
+        const r = await eda.pcb_Drc.overwriteRegionRules(${JSON.stringify(args.regionRules)});
+        results.regionRules = { ok: r === true, wrote: r };
+      } catch (e) { results.regionRules = { ok: false, error: e.message }; }`);
+      }
+      if (hasNetByNetRules) {
+        steps.push(`
+      try {
+        const r = await eda.pcb_Drc.overwriteNetByNetRules(${JSON.stringify(args.netByNetRules)});
+        results.netByNetRules = { ok: r === true, wrote: r };
+      } catch (e) { results.netByNetRules = { ok: false, error: e.message }; }`);
+      }
+
+      if (hasRules) {
+        steps.push(`
+      {
+        const current = await eda.pcb_Drc.getCurrentRuleConfiguration();
+        if (!current) {
+          results.globalConfig = { ok: false, error: "No current rule configuration — is a PCB document open and active?" };
+        } else {
+          const patch = ${JSON.stringify(args.rules)};
+          const deepMerge = ${DEEP_MERGE_SRC};
+          const merged = deepMerge(current, patch);
+          const race = await Promise.race([
+            eda.pcb_Drc.overwriteCurrentRuleConfiguration(merged).then((v) => ({ status: "resolved", value: v })),
+            new Promise((resolve) => setTimeout(() => resolve({ status: "timeout" }), 5000)),
+          ]);
+          if (race.status === "timeout") {
+            results.globalConfig = {
+              ok: false,
+              error: "overwriteCurrentRuleConfiguration hung (>5s) — known engine bug in EasyEDA Pro v2.2.47.x: the BETA global rule-write APIs deadlock (saveRuleConfiguration is also non-functional). Workarounds: edit global rules manually via Design > Design Rules, or update EasyEDA Pro. Per-net/region rules CAN be written: use the netRules/regionRules/netByNetRules parameters of this tool.",
+            };
+          } else {
+            const wrote = race.value;
+            let savedAs = null;
+            ${args.saveAs ? `savedAs = await eda.pcb_Drc.saveRuleConfiguration(merged, ${JSON.stringify(args.saveAs)}, true);` : ""}
+            results.globalConfig = { ok: wrote === true, wrote, savedAs, configName: merged.name };
+          }
+        }
+      }`);
+      }
+
+      steps.push(`
+      const overallOk = Object.values(results).every((r) => r.ok);
+      return { ok: overallOk, results };`);
+
+      return steps.join("\n");
+    },
   },
   {
     definition: {
