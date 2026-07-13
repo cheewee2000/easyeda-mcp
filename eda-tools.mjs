@@ -117,7 +117,7 @@ export const edaTools = [
 
       if (hasRules) {
         steps.push(`
-      {
+      try {
         const current = await eda.pcb_Drc.getCurrentRuleConfiguration();
         if (!current) {
           results.globalConfig = { ok: false, error: "No current rule configuration — is a PCB document open and active?" };
@@ -126,7 +126,9 @@ export const edaTools = [
           const deepMerge = ${DEEP_MERGE_SRC};
           const merged = deepMerge(current, patch);
           const race = await Promise.race([
-            eda.pcb_Drc.overwriteCurrentRuleConfiguration(merged).then((v) => ({ status: "resolved", value: v })),
+            eda.pcb_Drc.overwriteCurrentRuleConfiguration(merged)
+              .then((v) => ({ status: "resolved", value: v }))
+              .catch((e) => ({ status: "rejected", error: String((e && e.message) || e) })),
             new Promise((resolve) => setTimeout(() => resolve({ status: "timeout" }), 5000)),
           ]);
           if (race.status === "timeout") {
@@ -134,6 +136,8 @@ export const edaTools = [
               ok: false,
               error: "overwriteCurrentRuleConfiguration hung (>5s) — known engine bug in EasyEDA Pro v2.2.47.x: the BETA global rule-write APIs deadlock (saveRuleConfiguration is also non-functional). Workarounds: edit global rules manually via Design > Design Rules, or update EasyEDA Pro. Per-net/region rules CAN be written: use the netRules/regionRules/netByNetRules parameters of this tool.",
             };
+          } else if (race.status === "rejected") {
+            results.globalConfig = { ok: false, error: race.error };
           } else {
             const wrote = race.value;
             let savedAs = null;
@@ -141,7 +145,7 @@ export const edaTools = [
             results.globalConfig = { ok: wrote === true, wrote, savedAs, configName: merged.name };
           }
         }
-      }`);
+      } catch (e) { results.globalConfig = { ok: false, error: e.message }; }`);
       }
 
       steps.push(`
@@ -192,11 +196,20 @@ export const edaTools = [
       const { action, kind = "net_class", name, nets = [], color = "#1E90FF", positiveNet, negativeNet } = args;
       const n = JSON.stringify(name ?? "");
       const netsJson = JSON.stringify(nets);
+      const isNonEmptyString = (v) => typeof v === "string" && v.length > 0;
       if (kind === "differential_pair") {
         if (action === "list") return `const r = await eda.pcb_Drc.getAllDifferentialPairs(); return { ok: true, differentialPairs: r };`;
-        if (action === "create") return `const r = await eda.pcb_Drc.createDifferentialPair(${n}, ${JSON.stringify(positiveNet)}, ${JSON.stringify(negativeNet)}); return { ok: r === true, result: r };`;
+        if (action === "create") {
+          if (!isNonEmptyString(positiveNet) || !isNonEmptyString(negativeNet)) {
+            return `return { ok: false, error: ${JSON.stringify("positiveNet and negativeNet (non-empty strings) are required for differential_pair create")} };`;
+          }
+          return `const r = await eda.pcb_Drc.createDifferentialPair(${n}, ${JSON.stringify(positiveNet)}, ${JSON.stringify(negativeNet)}); return { ok: r === true, result: r };`;
+        }
         if (action === "delete") return `const r = await eda.pcb_Drc.deleteDifferentialPair(${n}); return { ok: r === true, result: r };`;
-        return `return { ok: false, error: "Unsupported action '${action}' for differential_pair (use list|create|delete)" };`;
+        return `return { ok: false, error: ${JSON.stringify(`Unsupported action '${action}' for differential_pair (use list|create|delete)`)} };`;
+      }
+      if (["create", "add_nets", "remove_nets"].includes(action) && !isNonEmptyString(name)) {
+        return `return { ok: false, error: ${JSON.stringify(`name (non-empty string) is required for net_class ${action}`)} };`;
       }
       switch (action) {
         case "list": return `const r = await eda.pcb_Drc.getAllNetClasses(); return { ok: true, netClasses: r };`;
@@ -204,7 +217,7 @@ export const edaTools = [
         case "delete": return `const r = await eda.pcb_Drc.deleteNetClass(${n}); return { ok: r === true, result: r };`;
         case "add_nets": return `const r = await eda.pcb_Drc.addNetToNetClass(${n}, ${netsJson}); return { ok: r === true, result: r };`;
         case "remove_nets": return `const r = await eda.pcb_Drc.removeNetFromNetClass(${n}, ${netsJson}); return { ok: r === true, result: r };`;
-        default: return `return { ok: false, error: "Unknown action" };`;
+        default: return `return { ok: false, error: ${JSON.stringify(`Unknown action '${action}'`)} };`;
       }
     },
   },
