@@ -1,6 +1,6 @@
 {
   "name": "easyeda-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server that wraps the easyeda-api-skill bridge to control EasyEDA Pro from Claude Code.",
   "type": "module",
   "main": "index.mjs",

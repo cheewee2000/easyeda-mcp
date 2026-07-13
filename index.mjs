@@ -74,7 +74,7 @@ async function executeCode(code, { windowId, timeoutMs = DEFAULT_EXECUTE_TIMEOUT
     if (!port) {
       return { ok: false, error: "Bridge unavailable; auto-start failed. Is EasyEDA Pro running with the run-api-gateway extension loaded?" };
     }
-    const body = { code };
+    const body = { code, timeoutMs };
     if (windowId) body.windowId = windowId;
     const r = await httpJson(
       `http://127.0.0.1:${port}/execute`,
@@ -187,7 +187,7 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: "easyeda-mcp", version: "0.2.0" },
+  { name: "easyeda-mcp", version: "0.2.1" },
   { capabilities: { tools: {} } }
 );
 
