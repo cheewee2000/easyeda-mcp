@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { edaTools } from "./eda-tools.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = join(__dirname, "logs");
@@ -38,12 +39,56 @@ async function httpJson(url, opts = {}, timeoutMs = 5000) {
   }
 }
 
+let cachedPort = null;
+
+async function probeBridgePort(p) {
+  const r = await httpJson(`http://127.0.0.1:${p}/health`, {}, 600);
+  return r.ok && r.data && r.data.service === "easyeda-bridge" ? p : null;
+}
+
 async function discoverBridgePort() {
-  for (let p = PORT_START; p <= PORT_END; p++) {
-    const r = await httpJson(`http://127.0.0.1:${p}/health`, {}, 600);
-    if (r.ok && r.data && r.data.service === "easyeda-bridge") return p;
+  const ports = [];
+  for (let p = PORT_START; p <= PORT_END; p++) ports.push(p);
+  const results = await Promise.all(ports.map(probeBridgePort));
+  return results.find((p) => p !== null) ?? null;
+}
+
+function invalidatePort() {
+  cachedPort = null;
+}
+
+async function getPort({ autostart = true } = {}) {
+  if (cachedPort) return cachedPort;
+  let port = await discoverBridgePort();
+  if (!port && autostart) {
+    const r = await ensureBridge();
+    port = r.port;
   }
-  return null;
+  cachedPort = port;
+  return port;
+}
+
+async function executeCode(code, { windowId, timeoutMs = DEFAULT_EXECUTE_TIMEOUT_MS } = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const port = await getPort();
+    if (!port) {
+      return { ok: false, error: "Bridge unavailable; auto-start failed. Is EasyEDA Pro running with the run-api-gateway extension loaded?" };
+    }
+    const body = { code };
+    if (windowId) body.windowId = windowId;
+    const r = await httpJson(
+      `http://127.0.0.1:${port}/execute`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      timeoutMs + 1000
+    );
+    if (r.status === 0) {
+      // connection-level failure: stale port — rediscover once
+      invalidatePort();
+      continue;
+    }
+    return { ok: r.ok, status: r.status, response: r.data, error: r.error };
+  }
+  return { ok: false, error: "Bridge unreachable after rediscovery retry." };
 }
 
 async function ensureBridge() {
@@ -142,11 +187,11 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: "easyeda-mcp", version: "0.1.0" },
+  { name: "easyeda-mcp", version: "0.2.0" },
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...tools, ...edaTools.map((t) => t.definition)] }));
 
 function reply(obj) {
   return {
@@ -160,13 +205,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     if (name === "easyeda_health") {
       const autostart = args.autostart !== false;
-      let port = await discoverBridgePort();
+      let port = await getPort({ autostart: false });
       let started = false;
       if (!port && autostart) {
         const r = await ensureBridge();
-        port = r.port;
-        started = r.started;
-        if (!port) {
+        if (r.port) {
+          cachedPort = r.port;
+          port = r.port;
+          started = r.started;
+        } else {
           return reply({
             ok: false,
             message: "Bridge auto-start failed",
@@ -175,13 +222,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           });
         }
       }
-      if (!port) return reply({ ok: false, message: "Bridge not running (autostart disabled)." });
+      if (!port) {
+        return reply({ ok: false, message: "Bridge not running (autostart disabled)." });
+      }
       const h = await httpJson(`http://127.0.0.1:${port}/health`);
+      if (!h.ok) invalidatePort();
       return reply({ ok: h.ok, port, started, health: h.data });
     }
 
     if (name === "easyeda_list_windows") {
-      const port = await discoverBridgePort();
+      const port = await getPort({ autostart: false });
       if (!port) return reply({ ok: false, message: "Bridge not running. Call easyeda_health to start it." });
       const r = await httpJson(`http://127.0.0.1:${port}/eda-windows`);
       return reply({ ok: r.ok, port, windows: r.data });
@@ -189,7 +239,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "easyeda_select_window") {
       if (!args.windowId) return reply({ ok: false, message: "windowId required" });
-      const port = await discoverBridgePort();
+      const port = await getPort({ autostart: false });
       if (!port) return reply({ ok: false, message: "Bridge not running" });
       const r = await httpJson(`http://127.0.0.1:${port}/eda-windows/select`, {
         method: "POST",
@@ -203,31 +253,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (typeof args.code !== "string" || !args.code.trim()) {
         return reply({ ok: false, message: "code (non-empty string) required" });
       }
-      let port = await discoverBridgePort();
-      if (!port) {
-        const r = await ensureBridge();
-        port = r.port;
-        if (!port) return reply({ ok: false, message: "Bridge unavailable; auto-start failed.", error: r.error });
-      }
-      const body = { code: args.code };
-      if (args.windowId) body.windowId = args.windowId;
-      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : DEFAULT_EXECUTE_TIMEOUT_MS;
-      const r = await httpJson(
-        `http://127.0.0.1:${port}/execute`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-        timeoutMs + 1000
-      );
-      return reply({ ok: r.ok, status: r.status, response: r.data, error: r.error });
+      const r = await executeCode(args.code, { windowId: args.windowId, timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : DEFAULT_EXECUTE_TIMEOUT_MS });
+      return reply(r);
     }
 
     if (name === "easyeda_start_bridge") {
-      const existing = await discoverBridgePort();
+      const existing = await getPort({ autostart: false });
       if (existing) return reply({ ok: true, message: "Already running", port: existing });
       const r = await ensureBridge();
+      if (r.port) cachedPort = r.port;
       return reply({
         ok: !!r.port,
         port: r.port,
@@ -238,7 +272,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     if (name === "easyeda_stop_bridge") {
-      const port = await discoverBridgePort();
+      const port = await getPort({ autostart: false });
       if (!port) return reply({ ok: true, message: "Not running" });
       const pid = await pidOnPort(port);
       if (!pid) return reply({ ok: false, message: `Could not resolve PID for port ${port}` });
@@ -247,7 +281,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       } catch (e) {
         return reply({ ok: false, message: e.message });
       }
+      invalidatePort();
       return reply({ ok: true, message: `Stopped bridge (pid=${pid}, port=${port})` });
+    }
+
+    const hl = edaTools.find((t) => t.definition.name === name);
+    if (hl) {
+      const r = await executeCode(hl.buildCode(args), { timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : DEFAULT_EXECUTE_TIMEOUT_MS });
+      return reply(r);
     }
 
     return reply({ ok: false, message: `Unknown tool: ${name}` });
