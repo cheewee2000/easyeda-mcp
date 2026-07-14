@@ -21,6 +21,7 @@ const SAMPLE_ARGS = {
   easyeda_save: [{}],
   easyeda_get_netlist: [{}, { verbose: true }],
   easyeda_survey_pcb: [{}, { net: "GND" }],
+  easyeda_sync_to_pcb: [{}, { apply: true }],
 };
 
 function assertValidAsyncBody(code) {

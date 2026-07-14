@@ -72,6 +72,7 @@ async function main() {
     "easyeda_save",
     "easyeda_get_netlist",
     "easyeda_survey_pcb",
+    "easyeda_sync_to_pcb",
   ];
   const missing = expected.filter((n) => !names.includes(n));
   if (missing.length) throw new Error(`Missing tools: ${missing.join(", ")}`);

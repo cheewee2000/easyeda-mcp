@@ -404,4 +404,112 @@ export const edaTools = [
       `;
     },
   },
+  {
+    definition: {
+      name: "easyeda_sync_to_pcb",
+      description:
+        "Reconcile the schematic netlist with the PCB — the safe wrapper around importChanges, which is known to silently no-op in several cases. DEFAULT is a dry run: it reads the authoritative schematic netlist (opening the schematic, then restoring the PCB tab), diffs it against the actual PCB pad nets (matched by Unique ID), and reports (a) per-pad net mismatches, (b) schematic components missing from the PCB, (c) PCB-only components (mechanical/free parts), and (d) schematic components with an EMPTY Unique ID — those can NEVER sync via importChanges and must be fixed first. Pass apply=true to save both documents, run importChanges with the explicit schematic UUID, and re-verify (before vs after). Requires an open project with both a schematic and a PCB.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          apply: {
+            type: "boolean",
+            default: false,
+            description: "Actually save both documents, run importChanges(schematicUuid), and re-verify. WARNING: modifies the PCB; importChanges may re-instantiate footprints for changed devices. Default false (diagnose only).",
+          },
+        },
+      },
+    },
+    buildCode: (args) => {
+      const apply = args.apply === true;
+      const reconcileSrc = `
+      const readNetlist = async () => {
+        await eda.dmt_EditorControl.openDocument(schPageUuid);
+        await new Promise((r) => setTimeout(r, 1500));
+        let raw = null; try { raw = JSON.parse(await eda.sch_Netlist.getNetlist()); } catch (e) {}
+        await eda.dmt_EditorControl.openDocument(pcbUuid);
+        await new Promise((r) => setTimeout(r, 300));
+        return raw;
+      };
+      const reconcile = async () => {
+        const raw = await readNetlist();
+        if (!raw) return { error: "Could not read schematic netlist (sch_Netlist.getNetlist returned nothing)." };
+        const schByUid = {}; const unsyncable = [];
+        for (const [key, c] of Object.entries(raw)) {
+          const p = (c && c.props) || {}; const uid = p["Unique ID"] || ""; const des = p["Designator"] || key;
+          if (!uid) { unsyncable.push(des); continue; }
+          schByUid[uid] = { designator: des, pins: (c && c.pins) || {} };
+        }
+        const comps = await eda.pcb_PrimitiveComponent.getAll();
+        const pcbByUid = {};
+        for (const c of comps) {
+          const uid = await c.getState_UniqueId(); const des = await c.getState_Designator();
+          const pins = {}; const pl = (await c.getAllPins()) || [];
+          for (const pad of pl) { const num = pad.getState_PadNumber ? await pad.getState_PadNumber() : null; if (num != null) pins[num] = pad.getState_Net ? await pad.getState_Net() : ""; }
+          pcbByUid[uid] = { designator: des, pins };
+        }
+        const netMismatches = []; const missingOnPcb = [];
+        for (const [uid, s] of Object.entries(schByUid)) {
+          const pc = pcbByUid[uid];
+          if (!pc) { missingOnPcb.push(s.designator); continue; }
+          for (const [pin, net] of Object.entries(s.pins)) {
+            const pcbNet = pc.pins[pin];
+            if (pcbNet === undefined) netMismatches.push({ designator: s.designator, pin, schematic: net, pcb: "<no such pad on PCB>" });
+            else if ((pcbNet || "") !== (net || "")) netMismatches.push({ designator: s.designator, pin, schematic: net, pcb: pcbNet });
+          }
+        }
+        const schUids = new Set(Object.keys(schByUid));
+        const extraOnPcb = Object.entries(pcbByUid).filter(([uid]) => !schUids.has(uid)).map(([, v]) => v.designator);
+        // A designator appearing in BOTH missing and extra means the schematic and PCB
+        // copies of that part carry DIFFERENT Unique IDs — importChanges cannot link them,
+        // so the part silently fails to update. This is the actionable diagnosis.
+        const extraSet = new Set(extraOnPcb);
+        const designatorUidMismatch = missingOnPcb.filter((d) => extraSet.has(d));
+        const mismatchSet = new Set(designatorUidMismatch);
+        return {
+          counts: { schematicComponents: Object.keys(schByUid).length, pcbComponents: comps.length, netMismatches: netMismatches.length, missingOnPcb: missingOnPcb.length, extraOnPcb: extraOnPcb.length, designatorUidMismatch: designatorUidMismatch.length, unsyncableInSchematic: unsyncable.length },
+          unsyncableInSchematic: unsyncable,
+          designatorUidMismatch,
+          missingOnPcb: missingOnPcb.filter((d) => !mismatchSet.has(d)),
+          extraOnPcb: extraOnPcb.filter((d) => !mismatchSet.has(d)),
+          netMismatches: netMismatches.slice(0, 100),
+          netMismatchesTruncated: netMismatches.length > 100,
+          inSync: netMismatches.length === 0 && missingOnPcb.length === 0 && unsyncable.length === 0 && designatorUidMismatch.length === 0,
+        };
+      };`;
+      return `
+      const proj = await eda.dmt_Project.getCurrentProjectInfo();
+      if (!proj) return { ok: false, error: "No current project — open a project first." };
+      const board = (proj.data || [])[0];
+      const schUuid = board && board.schematic && board.schematic.uuid;
+      const pages = (board && board.schematic && board.schematic.page) || [];
+      const schPageUuid = pages[0] && pages[0].uuid;
+      const pcbUuid = board && board.pcb && board.pcb.uuid;
+      if (!schPageUuid || !pcbUuid || !schUuid) return { ok: false, error: "Current board needs both a schematic and a PCB." };
+      ${reconcileSrc}
+      ${apply
+        ? `
+      const before = await reconcile();
+      if (before.error) return { ok: false, error: before.error };
+      const saved = {};
+      try { saved.schematic = await eda.sch_Document.save(); } catch (e) { saved.schematic = { error: e.message }; }
+      try { saved.pcb = await eda.pcb_Document.save(); } catch (e) { saved.pcb = { error: e.message }; }
+      await new Promise((r) => setTimeout(r, 3000));
+      await eda.dmt_EditorControl.openDocument(pcbUuid);
+      let importResult = null, importError = null;
+      try { importResult = await eda.pcb_Document.importChanges(schUuid); } catch (e) { importError = e.message; }
+      await new Promise((r) => setTimeout(r, 1500));
+      const after = await reconcile();
+      return {
+        ok: true, mode: "apply", saved, importResult, importError,
+        before: before.counts, after,
+        warning: before.unsyncableInSchematic.length ? ("These schematic components have empty Unique IDs and were NOT synced: " + before.unsyncableInSchematic.join(", ") + ". Fix their Unique ID attributes, then re-run.") : null,
+      };`
+        : `
+      const r = await reconcile();
+      if (r.error) return { ok: false, error: r.error };
+      return Object.assign({ ok: true, mode: "dryRun" }, r);`}
+      `;
+    },
+  },
 ];

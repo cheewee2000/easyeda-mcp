@@ -187,7 +187,7 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: "easyeda-mcp", version: "0.2.1" },
+  { name: "easyeda-mcp", version: "0.3.0" },
   { capabilities: { tools: {} } }
 );
 
