@@ -26,6 +26,11 @@ The bridge server and the EasyEDA-side extension are JLCEDA's published artifact
 | `easyeda_get_state` | One-call orientation: project, board, PCB, schematic, DRC config |
 | `easyeda_open_project` | Open a project by (partial) name |
 | `easyeda_save` | Save open PCB/schematic documents |
+| `easyeda_get_netlist` | Schematic netlist (connectivity source of truth); flags empty-Unique-ID parts that can't sync |
+| `easyeda_survey_pcb` | One-call component + per-net + per-layer geometry survey, normalized to mils |
+| `easyeda_sync_to_pcb` | Safe `importChanges`: diff netlist vs PCB pad nets (dry-run default), then optionally apply & re-verify |
+
+The last three distill hard-won behavioral traps from real board work (mixed 1-mil/10-mil getters, the `getNetlist` "i is not iterable" trap when a PCB tab is active, and `importChanges` silently no-op'ing on Unique-ID mismatches) into tools that handle them for you.
 
 ## Setup
 
