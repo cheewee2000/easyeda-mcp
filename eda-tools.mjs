@@ -302,4 +302,106 @@ export const edaTools = [
       return { ok: anyOk, results };
     `,
   },
+  {
+    definition: {
+      name: "easyeda_get_netlist",
+      description:
+        "Get the schematic netlist — the source of truth for connectivity — as a compact per-component map of {designator, uniqueId, pins:{pinNumber:net}} plus a net→pins index. Handles the well-known 'i is not iterable' trap (sch_Netlist.getNetlist throws when a PCB tab is active) by opening the schematic page, reading, then restoring the PCB tab. Flags components whose Unique ID attribute is empty in `unsyncableComponents` — those never sync to the PCB via importChanges (a common bug for API-created parts). Set verbose=true to also include each component's full property block (large). Requires an open project containing a schematic.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          verbose: { type: "boolean", default: false, description: "Also include each component's full property block (large output)." },
+        },
+      },
+    },
+    buildCode: (args) => `
+      const proj = await eda.dmt_Project.getCurrentProjectInfo();
+      if (!proj) return { ok: false, error: "No current project — open a project first." };
+      const board = (proj.data || [])[0];
+      const pages = (board && board.schematic && board.schematic.page) || [];
+      const schPageUuid = pages[0] && pages[0].uuid;
+      const pcbUuid = board && board.pcb && board.pcb.uuid;
+      if (!schPageUuid) return { ok: false, error: "No schematic page found in the current board." };
+      await eda.dmt_EditorControl.openDocument(schPageUuid);
+      await new Promise((r) => setTimeout(r, 1500));
+      let raw = null, err = null;
+      try { raw = JSON.parse(await eda.sch_Netlist.getNetlist()); } catch (e) { err = e.message; }
+      if (pcbUuid) { try { await eda.dmt_EditorControl.openDocument(pcbUuid); } catch (e) {} }
+      if (!raw) return { ok: false, error: "sch_Netlist.getNetlist() failed: " + err };
+      const components = Object.entries(raw).map(([key, c]) => {
+        const p = (c && c.props) || {};
+        return { key, uniqueId: p["Unique ID"] || null, designator: p["Designator"] || null, pins: (c && c.pins) || {} };
+      });
+      const unsyncableComponents = components.filter((c) => !c.uniqueId).map((c) => c.designator || c.key);
+      const netIndex = {};
+      for (const c of components) {
+        for (const [pin, net] of Object.entries(c.pins)) {
+          (netIndex[net] = netIndex[net] || []).push((c.designator || c.key) + "." + pin);
+        }
+      }
+      const out = { ok: true, componentCount: components.length, netCount: Object.keys(netIndex).length, components, netIndex, unsyncableComponents };
+      ${args.verbose === true ? "out.raw = raw;" : ""}
+      return out;
+    `,
+  },
+  {
+    definition: {
+      name: "easyeda_survey_pcb",
+      description:
+        "One-call PCB geometry survey, unit-normalized to mils (hides the 1-mil vs 10-mil getter trap) and token-bounded. Default returns every component (designator, uniqueId, x_mil, y_mil, rotation, layer), a per-net summary (pad/track/via counts), and per-layer track counts. Pass net='<NET>' to additionally return that net's pads, tracks, and vias in detail. Coordinates use EasyEDA's convention (Y extends downward as negative). Requires a PCB document in the current board.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          net: { type: "string", description: "Optional net name to also return detailed pad/track/via geometry for." },
+        },
+      },
+    },
+    buildCode: (args) => {
+      const netFilter = typeof args.net === "string" && args.net.length ? JSON.stringify(args.net) : "null";
+      return `
+      const netFilter = ${netFilter};
+      const round = (v) => (typeof v === "number" ? Math.round(v * 100) / 100 : v);
+      const comps = await eda.pcb_PrimitiveComponent.getAll();
+      const components = [];
+      for (const c of comps) {
+        components.push({
+          id: await c.getState_PrimitiveId(),
+          designator: c.getState_Designator ? await c.getState_Designator() : null,
+          uniqueId: c.getState_UniqueId ? await c.getState_UniqueId() : null,
+          x_mil: round(await c.getState_X()),
+          y_mil: round(await c.getState_Y()),
+          rotation: c.getState_Rotation ? await c.getState_Rotation() : null,
+          layer: c.getState_Layer ? await c.getState_Layer() : null,
+        });
+      }
+      const pads = await eda.pcb_PrimitivePad.getAll();
+      const lines = await eda.pcb_PrimitiveLine.getAll();
+      const vias = await eda.pcb_PrimitiveVia.getAll();
+      const netSummary = {};
+      const bump = (net, field) => { if (!net) return; (netSummary[net] = netSummary[net] || { padCount: 0, trackCount: 0, viaCount: 0 })[field]++; };
+      const layerTrackCount = {};
+      const detail = netFilter ? { pads: [], tracks: [], vias: [] } : null;
+      for (const p of pads) {
+        const net = p.getState_Net ? await p.getState_Net() : "";
+        bump(net, "padCount");
+        if (detail && net === netFilter) detail.pads.push({ id: await p.getState_PrimitiveId(), x_mil: round(await p.getState_X()), y_mil: round(await p.getState_Y()), net });
+      }
+      for (const l of lines) {
+        const net = l.getState_Net ? await l.getState_Net() : "";
+        const layer = l.getState_Layer ? await l.getState_Layer() : null;
+        layerTrackCount[layer] = (layerTrackCount[layer] || 0) + 1;
+        bump(net, "trackCount");
+        if (detail && net === netFilter) detail.tracks.push({ layer, width_mil: l.getState_LineWidth ? round(await l.getState_LineWidth()) : null, x1_mil: round(await l.getState_StartX()), y1_mil: round(await l.getState_StartY()), x2_mil: round(await l.getState_EndX()), y2_mil: round(await l.getState_EndY()), net });
+      }
+      for (const v of vias) {
+        const net = v.getState_Net ? await v.getState_Net() : "";
+        bump(net, "viaCount");
+        if (detail && net === netFilter) detail.vias.push({ id: await v.getState_PrimitiveId(), x_mil: round(await v.getState_X()), y_mil: round(await v.getState_Y()), net });
+      }
+      const out = { ok: true, counts: { components: components.length, pads: pads.length, tracks: lines.length, vias: vias.length, nets: Object.keys(netSummary).length }, components, netSummary, layerTrackCount };
+      if (detail) out.netDetail = Object.assign({ net: netFilter }, detail);
+      return out;
+      `;
+    },
+  },
 ];
